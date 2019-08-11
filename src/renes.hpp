@@ -1,3 +1,4 @@
+#pragma once
 
 #include "cpu.hpp"
 #include "ppu.hpp"
@@ -9,38 +10,7 @@
 #include <thread>
 #include <unistd.h>
 #include <chrono>
-
 #include <mutex>
-#include <condition_variable>
-
-class Semaphore {
-public:
-    Semaphore (int count_ = 0)
-    : count(count_) {}
-    
-    inline void notify()
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        count++;
-        cv.notify_one();
-    }
-    
-    inline void wait()
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        
-        while(count == 0){
-            cv.wait(lock);
-        }
-        count--;
-    }
-    
-private:
-    std::mutex mtx;
-    std::condition_variable cv;
-    int count;
-};
-
 
 namespace ReNes {
 
@@ -56,8 +26,6 @@ namespace ReNes {
         ~Nes()
         {
             // 等待线程退出
-            //            _stopMutex.lock();
-            
             stop();
             
             _runningThread.join();
@@ -82,7 +50,7 @@ namespace ReNes {
             bit8 b8_6 = *(bit8*)&rom[6];
             bit8 b8_7 = *(bit8*)&rom[7];
             
-            printf("文件长度 %d\n", length);
+            printf("文件长度 %zu\n", length);
             
             printf("[4] 16kB ROM: %d\n\
                    [5] 8kB VROM: %d\n\
@@ -133,7 +101,7 @@ namespace ReNes {
             {
                 const uint8_t* vromAddr = &rom[16+1024*16*rom16kB_count + 1024*8*i];
                 
-                memcpy(_ppu.vram()->masterData(), vromAddr, 1024*8);
+                _ppu.loadPetternTable(vromAddr);
             }
         }
         
@@ -152,23 +120,6 @@ namespace ReNes {
             setLogEnabled(debug);
             
             log("设置debug模式: %d\n", debug);
-        }
-        
-        void setFps(int fps)
-        {
-            _ppu.fps = fps;
-        }
-        
-        //        void setDumpScrollBuffer(bool enabled)
-        //        {
-        //            _ppu.dumpScrollBuffer = enabled;
-        //        }
-        
-        bool dumpScrollBuffer = false;
-        
-        int fps()
-        {
-            return _ppu.fps;
         }
         
         bool debug = false;
@@ -195,19 +146,19 @@ namespace ReNes {
             return &_ctr;
         }
         
-        long cmdTime() const
-        {
-            return _cmdTime;
-        }
+        inline
+        long cpuCycleTime() const { return _cpuCycleTime; }
         
-        long renderTime() const
-        {
-            return _renderTime;
-        }
+        inline
+        long renderTime() const { return _renderTime; }
+        
+        // 每帧花费时间: 纳秒
+        inline
+        long perFrameTime() const { return _perFrameTime; }
         
         // 回调函数
         std::function<bool(CPU*)> cpu_callback;
-        std::function<bool(PPU*)> ppu_callback;
+        std::function<bool(PPU*)> ppu_displayCallback;
         std::function<void()> willRunning;
         
         bool isRunning() const {return _isRunning;};
@@ -221,8 +172,6 @@ namespace ReNes {
         }
         
         void _run() {
-            
-            //            _stopMutex.lock();
             
             _stoped = false;
             
@@ -245,13 +194,6 @@ namespace ReNes {
                 // 写0x4016 2次，以设置从0x4016读取的硬件信息
                 std::function<void(int&,uint16_t&, uint16_t&)> dstAddrWriting = [value](int& dstWrite, uint16_t& dstAddrTmp, uint16_t& dstAddr){
                     
-                    //                    int writeBitIndex = dstWrite;
-                    //                    dstWrite = (dstWrite+1) % 2;
-                    //
-                    //
-                    //                    dstAddr &= (0xFF << dstWrite*8); // 清理高/低位
-                    //                    dstAddr |= (value << writeBitIndex*8); // 设置对应位
-                    
                     int writeBitIndex = (dstWrite+1) % 2;
                     
                     dstAddrTmp &= (0xFF << dstWrite*8); // 清理相反的高/低位
@@ -272,19 +214,16 @@ namespace ReNes {
                 }
             });
             
-            _mem.addReadingObserver(0x4016, [this, &dstWrite4016, &dstAddr4016](uint16_t addr, uint8_t* value, bool* cancel){
+            _mem.addReadingObserver(0x4016, [this, &dstWrite4016, &dstAddr4016](uint16_t addr, uint8_t* value){
                 
                 if (dstAddr4016 == 0x100)
                 {
                     *value = _ctr.nextKeyStatue();
                     
-                    //                        dstWrite4016 = 0;
+                    // dstWrite4016 = 0; ?
                 }
             });
             //-----------------------------------
-            
-//            const static double CPUFrequency = 1.789773; // 1.79Mhz
-//            const static uint32_t cpu_cyles = (1.0/(1024*1000*CPUFrequency)) * 1e9 ; // 572 ns
             
             // CPU周期线程
             std::thread cpu_thread = std::thread([this](){
@@ -292,13 +231,16 @@ namespace ReNes {
                 bool isFirstCPUCycleForFrame = true;
                 std::chrono::steady_clock::time_point firstTime;
                 
-                uint32_t cpuCyclesCountForFrame = 0;
-                uint32_t ppuCyclesCountForScanline = 0;
-                const uint32_t NumCyclesPerScanline = 341 / 3;
-                const uint32_t TimePerFrame = 1.0 / fps() * 1e9; // 每帧需要的时间(纳秒)
+                // 显示器制式数据: NTSC
+                const int frame_w = 341;
+                const int frame_h = 262;
+                const int FPS = 60; // 包含vblank时间
                 
-                // NTSC
-                const uint32_t NumScanline = 262;
+                _ppu.setSystemInfo(frame_w, frame_h);
+                
+                uint32_t cpuCyclesCountForFrame = 0;            // 每一帧内：cpu周期数计数器
+                const uint32_t NumScanpointPerCpuCycle = 3;     // 每个cpu周期能绘制的点数(每个像素需要1/3 CPU周期，由CPU和PPU的频率算得，见ppu.hpp)
+                const uint32_t TimePerFrame = 1.0 / FPS * 1e9; // 每帧需要的时间(纳秒)
                 
                 // 主循环
                 do {
@@ -312,58 +254,51 @@ namespace ReNes {
                     }
                     
                     // 执行指令
-                    int cyles = _cpu.exec();
+                    int cycles = _cpu.exec();
                     
+                    // 发生错误，退出
                     if (_cpu.error)
                         break;
                     
-                    cpuCyclesCountForFrame += cyles;
-                    ppuCyclesCountForScanline += cyles;
+                    // 当前CPU指令周期内，可以绘制多少个点
+                    cpuCyclesCountForFrame += cycles;
+
+                    // 满足一次扫描线所经过的CPU周期，执行下面代码，模拟这段时间内，PPU发生的工作
+                    bool vblankEvent;
+                    _ppu.drawScanline(&vblankEvent, cycles * NumScanpointPerCpuCycle);
                     
-                    if (ppuCyclesCountForScanline >= NumCyclesPerScanline)
+                    if (vblankEvent)
                     {
-                        ppuCyclesCountForScanline -= NumCyclesPerScanline;
-                        bool vblankEvent = _ppu.drawScanline();
-                        if (vblankEvent)
-                            _cpu.interrupts(CPU::InterruptTypeNMI);
+                        // vblank发生的时候，设置NMI中断
+                        _cpu.interrupts(CPU::InterruptTypeNMI);
                         
-                        if (_ppu.isOverScanline())
-                        {
-                            _displaySem.unlock(); // 显示图像
-                            
-                            // 每帧等待
-                            auto dif_ns = (std::chrono::steady_clock::now() - firstTime).count(); // 纳秒
-                            if ( dif_ns < TimePerFrame )
-                                usleep( (uint32_t)(TimePerFrame - dif_ns) / 1000 );
-                            
-                            // 计数器重置
-                            cpuCyclesCountForFrame -= NumCyclesPerScanline * NumScanline;
-                            isFirstCPUCycleForFrame = true;
-                        }
+                        // 刷新视图(异步) 刷新率由UI决定
+                        ppu_displayCallback(&_ppu);
+                    }
+                    
+                    // 最后一条扫描线完成(第261条扫描线，scanline+1 == 262)
+                    if (_ppu.currentScanline() == frame_h)
+                    {
+                        // 模拟等待，模拟每一帧完整时间花费
+                        auto currentFrameTime = (std::chrono::steady_clock::now() - firstTime).count(); // 纳秒
+                        _perFrameTime = currentFrameTime;
+                        _cpuCycleTime  = currentFrameTime / cpuCyclesCountForFrame;
+                        
+                        // 计数器重置
+                        cpuCyclesCountForFrame  = 0;
+                        isFirstCPUCycleForFrame = true;
+                        
+                        // 检查是否需要等待
+                        if ( currentFrameTime < TimePerFrame )
+                            usleep( (uint32_t)(TimePerFrame - currentFrameTime) / 1000 );
                     }
                     
                 }while(cpu_callback(&_cpu) && !_stoped);
                 
             });
             
-            std::thread display_thread = std::thread([this](){
-                
-                do {
-                    
-                    _displaySem.lock();
-                    
-                    if (dumpScrollBuffer)
-                        _ppu.dumpScrollToBuffer();
-                    
-                    ppu_callback(&_ppu);
-                    
-                }while(!_stoped);
-            });
-            
             // 等待线程结束
             cpu_thread.join();
-            _displaySem.unlock(); // ppu线程结束时再次通知
-            display_thread.join();
             
             if (_cpu.error)
             {
@@ -389,15 +324,14 @@ namespace ReNes {
         Memory _mem;
         Control _ctr;
         
-        long _cmdTime;
+        long _cpuCycleTime;
         long _renderTime;
+        long _perFrameTime;
         
         bool _stoped;
         std::function<void()> _stopedCallback;
         
         std::thread _runningThread;
-        
-        std::mutex _displaySem;
     };
     
     

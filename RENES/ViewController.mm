@@ -16,8 +16,6 @@
 
 using namespace ReNes;
 
-
-
 @interface ViewController()<NSTabViewDelegate>
 {
     Nes* _nes;
@@ -93,7 +91,6 @@ using namespace ReNes;
         
 //        @autoreleasepool {
         
-            //            NSString* filePath = [[NSBundle mainBundle] pathForResource:@"OUR.NES" ofType:@""];
             NSData* data = [NSData dataWithContentsOfFile:filePath];
             
             if (_nes != 0)
@@ -128,41 +125,42 @@ using namespace ReNes;
                     }
                 }
                 
-                
                 return true;
             };
             
-            _nes->ppu_callback = [self](PPU* ppu){
+            _nes->ppu_displayCallback = [self](PPU* ppu){
                 
-                //            @synchronized ((__bridge id)_nes)
+                if (ppu == _nes->ppu())
                 {
-                    if (ppu == _nes->ppu())
                     {
-                        {
-                            // 显示图片
-                            int width  = ppu->width();
-                            int height = ppu->height();
-                            uint8_t* srcBuffer = ppu->buffer();
-                            
-                            [self.displayView updateRGBData:srcBuffer size:CGSizeMake(width, height)];
-                            
-                        }
+                        // 显示图片
+                        int width  = ppu->width();
+                        int height = ppu->height();
+                        uint8_t* srcBuffer = ppu->buffer();
                         
+                        [self.displayView updateRGBData:srcBuffer size:CGSizeMake(width, height)];
+                        
+                    }
+                    
+                    {
+                        if ([_memTabView.selectedTabViewItem.identifier isEqualToString:@"scroll"])
                         {
+                            ppu->dumpScrollToBuffer();
+                            
                             // 显示图片
                             int width  = _nes->ppu()->width()*2;
                             int height = _nes->ppu()->height()*2;
-                            uint8_t* srcBuffer = _nes->ppu()->scrollBuffer();
+                            uint8_t* srcBuffer = ppu->scrollBufferRGB();
                             
                             [_scrollMirroringView updateRGBData:srcBuffer size:CGSizeMake(width, height)];
-                            
                         }
                     }
                 }
                 
                 return true;
             };
-            
+        
+            // for test
             //        _nes->mem()->addWritingObserver(0x2000, [self](uint16_t addr, uint8_t value){
             //
             //            if (addr == 0x2000 && (*(bit8*)&value).get(7) == 1)
@@ -177,8 +175,6 @@ using namespace ReNes;
             
             _nes->run();
             
-            _nes->dumpScrollBuffer = [_memTabView.selectedTabViewItem.identifier isEqualToString:@"scroll"];
-            
             NSLog(@"模拟器开始运行");
             
 //        }
@@ -190,23 +186,23 @@ using namespace ReNes;
     if ((self = [super initWithCoder:coder]))
     {
         // 相应tab切换
-        [[self rac_signalForSelector:@selector(tabView:didSelectTabViewItem:) fromProtocol:@protocol(NSTabViewDelegate)] subscribeNext:^(RACTuple* tuple) {
-            
-            if (tuple.first == _memTabView){
-                
-                NSString* identifier = [tuple.second identifier];
-                
-                if (_nes)
-                {
-                    _nes->dumpScrollBuffer = [identifier isEqualToString:@"scroll"];
-                }
-                
-//                _thread = std::thread(working);
-                
-                
-//                NSLog(@"%@", [tuple.second identifier]);
-            }
-        }];
+//        [[self rac_signalForSelector:@selector(tabView:didSelectTabViewItem:) fromProtocol:@protocol(NSTabViewDelegate)] subscribeNext:^(RACTuple* tuple) {
+//            
+//            if (tuple.first == _memTabView){
+//                
+//                NSString* identifier = [tuple.second identifier];
+//                
+//                if (_nes)
+//                {
+//                    _nes->dumpScrollBuffer = [identifier isEqualToString:@"scroll"];
+//                }
+//                
+////                _thread = std::thread(working);
+//                
+//                
+////                NSLog(@"%@", [tuple.second identifier]);
+//            }
+//        }];
     }
     
     return self;
@@ -230,6 +226,7 @@ using namespace ReNes;
 //        }
 //    });
     
+    _logView.editable = NO;
     _logView.font = [NSFont fontWithName:@"Courier" size:12];
     _memView.font = [NSFont fontWithName:@"Courier" size:12];
     _vramView.font = [NSFont fontWithName:@"Courier" size:12];
@@ -268,7 +265,7 @@ using namespace ReNes;
             std::string str;
             int count;
             NSTextView* dstView;
-            uint8_t* srcData;
+            const uint8_t* srcData;
             
             switch ([[_memTabView.selectedTabViewItem identifier] integerValue]) {
                 case 0:
@@ -279,7 +276,7 @@ using namespace ReNes;
                 case 1:
                     dstView = _vramView;
                     count = 1024*16;
-                    srcData = _nes->ppu()->vram()->masterData();
+                    srcData = const_cast<VRAM*>(_nes->ppu()->vram())->masterData();
                     break;
                     
                 case 2:
@@ -371,7 +368,7 @@ using namespace ReNes;
         
         //    log("[%ld][%04X] cmd: %x => ", execCmdLine, pc, cmd);
         
-        if (!SET_FIND(CMD_LIST, cmd))
+        if (!RENES_SET_FIND(CMD_LIST, cmd))
         {
 //            assert(!"未知的指令！");
 //            log("[%04X] cmd: %x => ", pc, cmd);
@@ -452,9 +449,11 @@ using namespace ReNes;
             
             const bool* statues = _nes->ctr()->statues();
             
+            double perFrameTime = (double)_nes->perFrameTime() / 1e9; // 每帧花费时间: 秒
+            
             _registersView.stringValue = [NSString stringWithFormat:@"PC: 0x%04X SP: 0x%04X\n\
 C:%d Z:%d I:%d D:%d B:%d _:%d V:%d N:%d\n\
-A:%d X:%d Y:%d (%.9lf, %lf)\n\
+A:%d X:%d Y:%d - %.9lf(%.9lf), %lf - fps %d\n\
 %d %d %d %d %d %d %d %d\n\
 %s", regs.PC, regs.SP,
                                           regs.P.get(CPU::__registers::C),
@@ -466,7 +465,7 @@ A:%d X:%d Y:%d (%.9lf, %lf)\n\
                                           regs.P.get(CPU::__registers::V),
                                           regs.P.get(CPU::__registers::N),
                                           regs.A,regs.X,regs.Y,
-                                          (double)_nes->cmdTime() / 1e9, (double)_nes->renderTime() / 1e9,
+                                          (double)_nes->cpuCycleTime() / 1e9, (double)572 / 1e9, perFrameTime, (int)(1.0 / perFrameTime),
                                           statues[0], statues[1], statues[2], statues[3], statues[4], statues[5], statues[6], statues[7],
                                           _nes->ppu()->testLog.c_str()];
         
